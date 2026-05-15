@@ -77,14 +77,9 @@ pub(crate) struct Task {
     /// Used to mark the coroutine as Completed when the task finishes.
     pub coroutine_id: Option<HeapId>,
     /// GatherFuture this task belongs to (if spawned by gather).
-    /// Used to cancel sibling tasks when this task fails.
+    /// Used to cancel sibling tasks when this task fails. The gather itself
+    /// stores the slot-index mapping under `AwaitedGather::pending_tasks`.
     pub gather_id: Option<HeapId>,
-    /// Indices in the gather's results where this task's result should be stored.
-    ///
-    /// A single task may map to multiple gather slots when the same coroutine
-    /// is passed to `asyncio.gather` more than once: e.g. `gather(c, c)` spawns
-    /// one task that fills slots `[0, 1]`. Empty for non-gather tasks.
-    pub gather_result_indices: Vec<usize>,
     /// Current execution state.
     pub state: TaskState,
     /// CallId that unblocked this task (set when task transitions from Blocked to Ready).
@@ -138,15 +133,7 @@ impl Task {
     /// * `id` - Unique task identifier
     /// * `coroutine_id` - Optional HeapId of the coroutine being executed
     /// * `gather_id` - Optional HeapId of the GatherFuture this task belongs to
-    /// * `gather_result_indices` - Slots in the gather's results this task fills
-    ///   (empty for non-gather tasks; multiple when the same coroutine appears
-    ///   more than once in the gather)
-    pub fn new(
-        id: TaskId,
-        coroutine_id: Option<HeapId>,
-        gather_id: Option<HeapId>,
-        gather_result_indices: Vec<usize>,
-    ) -> Self {
+    pub fn new(id: TaskId, coroutine_id: Option<HeapId>, gather_id: Option<HeapId>) -> Self {
         Self {
             id,
             frames: Vec::new(),
@@ -155,7 +142,6 @@ impl Task {
             instruction_ip: 0,
             coroutine_id,
             gather_id,
-            gather_result_indices,
             state: TaskState::Ready,
             unblocked_by: None,
         }
@@ -178,6 +164,9 @@ pub(crate) struct PendingCallData {
     pub args: ArgValues,
     /// Task that created this call (for ignoring results if task is cancelled).
     pub creator_task: TaskId,
+    /// If `Some`, the resolved value should be fanned into the named
+    /// `GatherFuture` instead of directly unblocking `creator_task`.
+    pub gather: Option<HeapId>,
 }
 
 /// Scheduler for managing call IDs, async tasks, and external call tracking.
@@ -212,12 +201,6 @@ pub(crate) struct Scheduler {
     resolved: AHashMap<CallId, Value>,
     /// CallIds that have been awaited (to detect double-await).
     consumed: AHashSet<CallId>,
-    /// Maps CallId -> (gather_heap_id, result_indices) for gathers waiting on external futures.
-    ///
-    /// When a CallId is resolved, the result is stored in the gather's results at every
-    /// listed index. Multiple indices arise when the same external future is passed to
-    /// `asyncio.gather` more than once, e.g. `gather(f, f)`.
-    gather_waiters: AHashMap<CallId, (HeapId, Vec<usize>)>,
 }
 
 impl Scheduler {
@@ -228,7 +211,7 @@ impl Scheduler {
     /// immediately without needing to be scheduled.
     pub fn new() -> Self {
         let main_task_id = TaskId::default();
-        let mut main_task = Task::new(main_task_id, None, None, Vec::new());
+        let mut main_task = Task::new(main_task_id, None, None);
         // Main task starts Running, not Ready (it's the current task, not waiting)
         main_task.state = TaskState::Ready; // Will be set properly when it blocks
         let mut tasks = AHashMap::new();
@@ -242,7 +225,6 @@ impl Scheduler {
             pending_calls: AHashMap::new(),
             resolved: AHashMap::new(),
             consumed: AHashSet::new(),
-            gather_waiters: AHashMap::new(),
         }
     }
 
@@ -290,12 +272,14 @@ impl Scheduler {
         self.pending_calls.insert(call_id, data);
     }
 
-    /// Removes a call_id from the pending_calls map.
+    /// Removes the pending-call entry for `call_id` and returns its data, if
+    /// present.
     ///
-    /// Called when resolving a gather's external future - the call is no longer
-    /// pending once the result has been stored in the gather's results.
-    pub fn remove_pending_call(&mut self, call_id: CallId) {
-        self.pending_calls.remove(&call_id);
+    /// Callers that only want to remove the entry can ignore the return
+    /// value (e.g. `HeapRead::fail` clearing every external the gather was
+    /// waiting on).
+    pub fn take_pending_call(&mut self, call_id: CallId) -> Option<PendingCallData> {
+        self.pending_calls.remove(&call_id)
     }
 
     /// Returns true if a CallId has already been awaited (consumed).
@@ -311,44 +295,33 @@ impl Scheduler {
 
     /// Registers a gather as waiting on an external future.
     ///
-    /// When the CallId is resolved, the result will be stored in the gather's results
-    /// at every index in `result_indices`. Multiple indices arise when the same
-    /// external future is passed to `gather` more than once.
-    pub fn register_gather_for_call(&mut self, call_id: CallId, gather_id: HeapId, result_indices: Vec<usize>) {
-        self.gather_waiters.insert(call_id, (gather_id, result_indices));
+    /// Mutates the existing `PendingCallData` entry to attach the gather
+    /// pointer. The CallId must already be present in `pending_calls` — the
+    /// host adds it via `add_pending_call` when it returns
+    /// `ExtFunctionResult::Future` for the original call, and gather routing
+    /// is registered later when the gather is awaited.
+    ///
+    /// The slot indices the resolved value should fan into live on the
+    /// gather itself, under `AwaitedGather::pending_calls`.
+    ///
+    /// # Panics
+    /// Panics if the CallId is not in `pending_calls` or is already routed
+    /// to a gather (would indicate a bug in await-side bookkeeping).
+    pub fn register_gather_for_call(&mut self, call_id: CallId, gather_id: HeapId) {
+        let data = self
+            .pending_calls
+            .get_mut(&call_id)
+            .expect("register_gather_for_call: CallId must already be a pending call");
+        debug_assert!(
+            data.gather.is_none(),
+            "register_gather_for_call: CallId already routed to a gather",
+        );
+        data.gather = Some(gather_id);
     }
 
-    /// Returns gather info if a gather is waiting on this CallId.
-    ///
-    /// Returns `(gather_heap_id, result_indices)` if found, `None` otherwise.
-    /// Removes the entry from `gather_waiters`.
-    pub fn take_gather_waiter(&mut self, call_id: CallId) -> Option<(HeapId, Vec<usize>)> {
-        self.gather_waiters.remove(&call_id)
-    }
-
-    /// Resolves a CallId with a value.
-    ///
-    /// Stores the value for later retrieval when the future is awaited.
-    /// If a task is blocked on this call, it will be unblocked.
-    ///
-    /// Uses `pending_calls` for O(1) lookup of the blocked task instead of
-    /// scanning all tasks.
-    pub fn resolve(&mut self, call_id: CallId, value: Value) {
-        // Get blocked task from pending_calls before removing (O(1) lookup)
-        let blocked_task = self.pending_calls.remove(&call_id).map(|data| data.creator_task);
-
-        // Store the resolved value
+    /// Records a resolved value for `call_id`.
+    pub fn record_resolved(&mut self, call_id: CallId, value: Value) {
         self.resolved.insert(call_id, value);
-
-        // Unblock the task if found
-        if let Some(task_id) = blocked_task {
-            let task = self.get_task_mut(task_id);
-            if matches!(task.state, TaskState::BlockedOnCall(cid) if cid == call_id) {
-                task.state = TaskState::Ready;
-                task.unblocked_by = Some(call_id);
-                self.ready_queue.push_back(task_id);
-            }
-        }
     }
 
     /// Takes the resolved value for a CallId, if available.
@@ -424,8 +397,6 @@ impl Scheduler {
     /// * `heap` - Heap to increment reference counts in
     /// * `coroutine_id` - HeapId of the coroutine to execute
     /// * `gather_id` - Optional HeapId of the GatherFuture this task belongs to
-    /// * `gather_result_indices` - Indices in the gather's results for this task
-    ///   (multiple when the same coroutine appears more than once in the gather)
     ///
     /// # Returns
     /// The TaskId of the newly created task.
@@ -434,7 +405,6 @@ impl Scheduler {
         heap: &Heap<impl ResourceTracker>,
         coroutine_id: HeapId,
         gather_id: Option<HeapId>,
-        gather_result_indices: Vec<usize>,
     ) -> TaskId {
         let task_id = TaskId::new(self.next_task_id);
         self.next_task_id += 1;
@@ -446,7 +416,7 @@ impl Scheduler {
             heap.inc_ref(gid);
         }
 
-        let task = Task::new(task_id, Some(coroutine_id), gather_id, gather_result_indices);
+        let task = Task::new(task_id, Some(coroutine_id), gather_id);
         self.tasks.insert(task_id, task);
         self.ready_queue.push_back(task_id);
 
@@ -479,18 +449,10 @@ impl Scheduler {
         self.current_task = task_id;
     }
 
-    /// Marks a task as completed with a result value.
-    ///
-    /// If the task is part of a gather, updates the gather's results.
-    /// If this completes the gather, unblocks the waiting task.
-    pub fn complete_task(&mut self, task_id: TaskId, result: Value, heap: &mut Heap<impl ResourceTracker>) {
-        self.set_state(task_id, TaskState::Completed(result), heap);
-    }
-
     /// Marks a task as failed with an error.
     ///
     /// If the task is part of a gather, returns the gather_id so the caller
-    /// can collect siblings from `GatherFuture.task_ids` on the heap.
+    /// can collect siblings from the gather on the heap.
     ///
     /// # Returns
     /// The gather_id if this task belongs to a gather (for sibling lookup).
@@ -520,16 +482,48 @@ impl Scheduler {
             return;
         };
 
+        // If we're cancelling the current task, clear `current_task` so callers
+        // don't try to look up a task that's about to be dropped (e.g.
+        // `resume_with_resolved_futures` after `fail_for_call` tore down the
+        // gather containing the previously-current task).
+        if self.current_task == Some(task_id) {
+            self.current_task = None;
+        }
+
         if !task.is_finished() {
             // Remove from ready queue if present (do this before getting mutable task reference)
             self.ready_queue.retain(|&id| id != task_id);
 
+            // Drop any *non-gather-routed* external calls this task was the
+            // creator of. The host may still respond to them later; with the
+            // entry gone, `take_pending_call` returns `None` and
+            // `resolve_future` drops the resolved value instead of trying
+            // to wake a removed task.
+            //
+            // Gather-routed entries are kept: even though `task_id` made the
+            // call, ownership effectively transferred to the gather when
+            // `register_gather_for_call` set `data.gather`. Dropping them
+            // would orphan the gather (its own `pending_calls` map still
+            // references the CallId, so it would wait forever for a
+            // resolution that we'd silently drop). Gather-routed entries are
+            // cleaned up either by the gather completing successfully
+            // (`resolve_child` removes them on resolution) or by the gather
+            // failing (`HeapRead::fail` drains them on tear-down).
+            self.pending_calls
+                .retain(|_, data| data.creator_task != task_id || data.gather.is_some());
+
             // If blocked on a nested gather, recursively cancel inner tasks first.
+            // Only an `Awaited` gather has spawned tasks — a `Pending` gather
+            // has never run, and `Completed`/`Failed` mean the gather has
+            // already shed its child tasks.
             if let TaskState::BlockedOnGather(gather_id) = task.state {
                 let HeapData::GatherFuture(gather) = heap.get(gather_id) else {
                     panic!("Scheduler::cancel_task: expected GatherFuture heap entry for gather_id {gather_id:?}");
                 };
-                let inner_task_ids = gather.task_ids.clone();
+                let inner_task_ids: Vec<TaskId> = gather
+                    .as_awaited()
+                    .map(|awaited| awaited.pending_tasks.keys().copied().collect())
+                    .unwrap_or_default();
                 for inner_task_id in inner_task_ids {
                     self.cancel_task(inner_task_id, heap);
                 }
@@ -540,63 +534,30 @@ impl Scheduler {
     }
 
     /// Fails the task blocked on a specific CallId with an error.
+    ///
+    /// For a gather-routed call, tears the gather down eagerly via
+    /// [`HeapRead::fail`]. For an "indirect" failure (the call was made by a
+    /// task that's a child of a gather), just sets the creator task's state
+    /// to `Failed`; the failure is then surfaced when a sibling completes
+    /// and `HeapRead::resolve_child`'s completion scan finds the Failed
+    /// task. (The two-phase pattern keeps gather teardown anchored in the
+    /// run-loop side, where exception propagation through the waiter's
+    /// frame is straightforward.)
     pub fn fail_for_call(&mut self, call_id: CallId, error: RunError, heap: &mut HeapReader<'_, impl ResourceTracker>) {
-        // Get blocked task from pending_calls (O(1) lookup)
-        let Some(pending_call) = self.pending_calls.remove(&call_id) else {
-            // No pending call found - nothing to fail. Possibly cancelled by a sibling task failure.
+        let Some(pending) = self.pending_calls.remove(&call_id) else {
+            // Typically means the call was already resolved or cancelled; no task to fail.
             return;
         };
-
-        let task_id = pending_call.creator_task;
-
-        // Check if a gather is waiting on this CallId
-        if let Some((gather_id, _result_indices)) = self.take_gather_waiter(call_id) {
-            self.remove_pending_call(call_id);
-
-            // Get the gather's waiter, task_ids, and OTHER pending calls
-            // We need to remove all pending calls for this gather from gather_waiters
-            // before we dec_ref the gather, otherwise subsequent errors for the same
-            // gather would try to access a freed heap object.
-            // Use get_mut and take to avoid allocations - gather is being destroyed anyway.
+        if let Some(gather_id) = pending.gather {
             let HeapReadOutput::GatherFuture(mut gather) = heap.read(gather_id) else {
                 panic!("gather_id doesn't point to a GatherFuture")
             };
-            let gather_mut = gather.get_mut(heap);
-            let mut other_pending_calls = mem::take(&mut gather_mut.pending_calls);
-            other_pending_calls.retain(|&cid| cid != call_id);
-            let Some(waiter_id) = gather_mut.waiter else {
-                panic!("gather has no waiter task")
-            };
-            let task_ids = mem::take(&mut gather_mut.task_ids);
-            // Drop the HeapRead before operations that may free heap objects
+            let waiter_id = gather.fail(self, heap, &error);
             drop(gather);
-
-            // Remove all other pending calls for this gather from gather_waiters and pending_calls
-            // This prevents subsequent errors from trying to access the freed gather
-            for other_call_id in other_pending_calls {
-                self.take_gather_waiter(other_call_id);
-                self.remove_pending_call(other_call_id);
-            }
-
-            // Cancel all sibling tasks in the gather
-            for sibling_id in task_ids {
-                self.cancel_task(sibling_id, heap);
-            }
-
-            // Fail the waiter task (the task that awaited the gather)
             self.fail_task(waiter_id, error, heap);
         } else {
-            // Not a gather-related error - just fail the blocked task.
-            self.fail_task(task_id, error, heap);
+            self.fail_task(pending.creator_task, error, heap);
         }
-    }
-
-    /// Returns the task that created a specific pending call.
-    ///
-    /// Used to check if a pending call's creator task has been cancelled.
-    #[inline]
-    pub fn get_pending_call_creator(&self, call_id: CallId) -> Option<TaskId> {
-        self.pending_calls.get(&call_id).map(|data| data.creator_task)
     }
 
     /// Returns true if a task has been cancelled or failed.
