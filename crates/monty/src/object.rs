@@ -200,6 +200,7 @@ fn monty_datetime_naive(datetime: &MontyDateTime) -> Option<NaiveDateTime> {
 /// Most variants can be used both as inputs (passed to `Executor::run()`) and outputs
 /// (returned from execution). However:
 /// - `Repr` is output-only: represents values that have no direct `MontyObject` mapping
+/// - `Cycle` is output-only: marks where a cyclic structure referred back to itself
 /// - `Exception` can be used as input (to raise) or output (when code raises)
 ///
 /// # Hashability
@@ -210,23 +211,10 @@ fn monty_datetime_naive(datetime: &MontyDateTime) -> Option<NaiveDateTime> {
 ///
 /// # Serialization
 ///
-/// `MontyObject` has two distinct serialization paths:
-///
-/// 1. **Derived serde (round-trippable)** — the default `Serialize` /
-///    `Deserialize` impls use an externally tagged format
-///    (`{"Int": 42}`, `{"String": "hi"}`, ...). This is what `postcard` and
-///    `serde_json::to_string(&obj)` produce. It is lossless and designed for
-///    snapshots and binary transport, not for human-facing JSON.
-///
-/// 2. **Natural JSON (output-only)** — wrap the value in
-///    [`JsonMontyObject`](crate::JsonMontyObject) for a much more ergonomic
-///    shape where JSON-native Python values serialize bare
-///    (`42`, `"hi"`, `[...]`, `{"a": 1}`) and non-JSON-native values use a
-///    `{"$<tag>": ...}` convention (`{"$tuple": [...]}`, `{"$bytes": [...]}`,
-///    `{"$ellipsis": "..."}`, `{"$float": "nan"}`, ...). See the
-///    `object_json` module docs for the full mapping. This form is
-///    intentionally not round-trippable — use the derived format if you
-///    need to reconstruct a `MontyObject` from JSON.
+/// The derived `Serialize` / `Deserialize` impls use an externally tagged
+/// format (`{"Int": 42}`, `{"String": "hi"}`, ...). This is what `postcard`
+/// and `serde_json::to_string(&obj)` produce. It is lossless and designed
+/// for snapshots and binary transport, not for human-facing JSON.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum MontyObject {
     /// Python's `Ellipsis` singleton (`...`).
@@ -330,11 +318,14 @@ pub enum MontyObject {
     /// Represents a cycle detected during Value-to-MontyObject conversion.
     ///
     /// When converting cyclic structures (e.g., `a = []; a.append(a)`), this variant
-    /// is used to break the infinite recursion. Contains the heap ID and the type-specific
-    /// placeholder string (e.g., `"[...]"` for lists, `"{...}"` for dicts).
+    /// is used to break the infinite recursion. Contains an opaque identity token
+    /// (the raw heap index of the object the cycle points back to — meaningful only
+    /// for equality, and only within the result that produced it) and the
+    /// type-specific placeholder string (e.g., `"[...]"` for lists, `"{...}"` for
+    /// dicts). Two `Cycle` values compare equal if they refer to the same object.
     ///
     /// This is output-only and cannot be used as an input to `Executor::run()`.
-    Cycle(HeapId, String),
+    Cycle(usize, String),
 }
 
 impl fmt::Display for MontyObject {
@@ -365,6 +356,17 @@ impl MontyObject {
     /// Creates a new `MontyObject` from something that can be converted into a `DictPairs`.
     pub fn dict(dict: impl Into<DictPairs>) -> Self {
         Self::Dict(dict.into())
+    }
+
+    /// Resolves a builtin function by its Python name (e.g. `"len"`).
+    ///
+    /// The `BuiltinsFunctions` enum inside [`MontyObject::BuiltinFunction`] is
+    /// crate-private, so boundaries that serialize a builtin function by name
+    /// (e.g. the subprocess wire protocol) use this to reconstruct the variant.
+    /// The name matches the variant's `Display` output.
+    #[must_use]
+    pub fn builtin_function_from_name(name: &str) -> Option<Self> {
+        name.parse::<BuiltinsFunctions>().ok().map(Self::BuiltinFunction)
     }
 
     /// Converts this `MontyObject` into an `Value`, allocating on the heap if needed.
@@ -541,6 +543,40 @@ impl MontyObject {
         }
     }
 
+    /// Shallow host footprint of a freshly decoded `obj`: the fixed [`MontyObject`]
+    /// size plus any leaf payload it owns *directly* (string/bytes/bigint bytes, and
+    /// the `Vec<String>` field names of structured values, which aren't themselves
+    /// `MontyObject`s and would otherwise be uncharged). Container elements are
+    /// excluded — each charges its own size via [`decode_field`], so a list charges
+    /// 88 bytes here.
+    pub fn host_size(&self) -> usize {
+        /// Fixed size of one `MontyObject` (88 bytes today) — the per-element cost
+        /// that makes cheap wire elements amplify on the host.
+        const BASE: usize = size_of::<MontyObject>();
+        /// `String` header counted per owned metadata string; content dominates.
+        const STR_OVERHEAD: usize = size_of::<String>();
+
+        let names_len = |names: &[String]| -> usize { names.iter().map(|s| STR_OVERHEAD + s.len()).sum() };
+
+        let payload = match self {
+            Self::String(s) | Self::Path(s) | Self::Repr(s) => s.len(),
+            Self::Cycle(_, placeholder) => placeholder.len(),
+            Self::Bytes(b) => b.len(),
+            // Saturate rather than truncate on a 32-bit `usize`: an over-large
+            // estimate only trips the budget sooner, which is the safe direction.
+            Self::BigInt(bi) => usize::try_from(bi.bits().div_ceil(8)).unwrap_or(usize::MAX),
+            Self::Exception { arg, .. } => arg.as_ref().map_or(0, String::len),
+            Self::FileHandle(fh) => fh.path.len(),
+            Self::Function { name, docstring } => name.len() + docstring.as_ref().map_or(0, String::len),
+            Self::NamedTuple {
+                type_name, field_names, ..
+            } => type_name.len() + names_len(field_names),
+            Self::Dataclass { name, field_names, .. } => name.len() + names_len(field_names),
+            _ => 0,
+        };
+        BASE + payload
+    }
+
     /// Top-level entry into [`from_value_inner`], allocating the visited-set used
     /// for cycle detection.
     fn from_value(object: &Value, vm: &mut VM<'_, impl ResourceTracker>) -> Self {
@@ -581,10 +617,10 @@ impl MontyObject {
                 if visited.contains(id) {
                     // Cycle detected - return appropriate placeholder
                     return match vm.heap.get(*id) {
-                        HeapData::List(_) => Self::Cycle(*id, "[...]".to_owned()),
-                        HeapData::Tuple(_) | HeapData::NamedTuple(_) => Self::Cycle(*id, "(...)".to_owned()),
-                        HeapData::Dict(_) => Self::Cycle(*id, "{...}".to_owned()),
-                        _ => Self::Cycle(*id, "...".to_owned()),
+                        HeapData::List(_) => Self::Cycle(id.index(), "[...]".to_owned()),
+                        HeapData::Tuple(_) | HeapData::NamedTuple(_) => Self::Cycle(id.index(), "(...)".to_owned()),
+                        HeapData::Dict(_) => Self::Cycle(id.index(), "{...}".to_owned()),
+                        _ => Self::Cycle(id.index(), "...".to_owned()),
                     };
                 }
 
@@ -1297,6 +1333,8 @@ impl PartialEq for MontyObject {
             (Self::Repr(a), Self::Repr(b)) => a == b,
             (Self::Cycle(a, _), Self::Cycle(b, _)) => a == b,
             (Self::Type(a), Self::Type(b)) => a == b,
+            // matches Python, where builtins are singletons: `len == len` is True
+            (Self::BuiltinFunction(a), Self::BuiltinFunction(b)) => a == b,
             _ => false,
         }
     }

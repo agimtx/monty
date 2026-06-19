@@ -8,7 +8,7 @@ import {
   MontyRuntimeError,
   type ResourceLimits,
   type ResumeOptions,
-} from '../wrapper'
+} from '../ts/wasm.js'
 
 // =============================================================================
 // start() returns MontyComplete tests
@@ -78,6 +78,15 @@ test('start progress with kwargs', (t) => {
   t.is(snapshot.functionName, 'func')
   t.deepEqual(snapshot.args, [])
   t.deepEqual(snapshot.kwargs, { a: 1, b: 'two' })
+})
+
+test('start progress kwargs cannot replace prototype', (t) => {
+  const m = new Monty('func(**{"__proto__": {"polluted": True}})')
+  const progress = m.start()
+  t.true(progress instanceof MontySnapshot)
+  const snapshot = progress as MontySnapshot
+  t.is((snapshot.kwargs as { polluted?: unknown }).polluted, undefined)
+  t.deepEqual(snapshot.kwargs.__proto__, new Map([['polluted', true]]))
 })
 
 test('start progress with mixed args kwargs', (t) => {

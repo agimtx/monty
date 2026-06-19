@@ -1,5 +1,8 @@
-// Custom error classes that extend Error for proper JavaScript error handling.
-// These wrap the native Rust classes to provide instanceof support.
+// The legacy in-process API, exported as `@pydantic/monty/wasm`: wraps the
+// native (or wasm) classes with proper JS error subclasses and ergonomic
+// option handling. This is the only execution surface available on
+// wasm/browsers, where subprocesses (and so the pool API) do not exist —
+// note a sandbox crash here takes the host process with it.
 
 import type {
   ExceptionInfo,
@@ -16,7 +19,7 @@ import type {
   RunOptions as NativeRunOptions,
   SnapshotLoadOptions,
   StartOptions as NativeStartOptions,
-} from './index.js'
+} from '../index.js'
 
 import {
   Monty as NativeMonty,
@@ -27,7 +30,7 @@ import {
   MontyComplete as NativeMontyComplete,
   MontyException as NativeMontyException,
   MontyTypingError as NativeMontyTypingError,
-} from './index.js'
+} from '../index.js'
 
 export type {
   MontyOptions,

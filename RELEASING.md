@@ -6,13 +6,15 @@ Update version in both files:
 
 ```bash
 # Edit Cargo.toml - update workspace.package.version
-# Edit crates/monty-js/package.json - update version
+# Edit crates/monty-js/package.json - update version AND the optionalDependencies
+#   versions (they must all equal the package version; CI's
+#   create-platform-packages fails if they drift)
 
 # Update Cargo.lock
 make lint-rs
 ```
 
-Both `Cargo.toml` and `package.json` should have the same version (e.g., `0.0.2`).
+`Cargo.toml` and `package.json` should have the same version (e.g., `0.0.2`).
 
 ## 2. Commit and Push
 
@@ -36,7 +38,7 @@ git push
 Once the tag is pushed, CI will:
 - Build wheels for all platforms
 - Publish to PyPI (`pydantic-monty`)
-- Publish to NPM (`@pydantic/monty`)
+- Publish to NPM (`@pydantic/monty` + the platform packages carrying the napi library, the `monty` binary, and the wasm build)
 
 Monitor the workflow at https://github.com/pydantic/monty/actions
 

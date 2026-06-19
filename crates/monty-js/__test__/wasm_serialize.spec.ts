@@ -1,6 +1,6 @@
 import test from 'ava'
 
-import { Monty, MontySnapshot, MontyNameLookup, MontyComplete, type ResourceLimits } from '../wrapper'
+import { Monty, MontySnapshot, MontyNameLookup, MontyComplete, type ResourceLimits } from '../ts/wasm.js'
 import { Buffer } from 'node:buffer'
 
 // =============================================================================

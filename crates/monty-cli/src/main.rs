@@ -16,6 +16,8 @@ use rustyline::{DefaultEditor, error::ReadlineError};
 #[rustfmt::skip]
 use monty_type_checking::{SourceFile, type_check};
 
+mod subprocess;
+
 /// ANSI escape code for dim/gray text.
 const DIM: &str = "\x1b[2m";
 /// ANSI escape code for bold red text (errors).
@@ -30,12 +32,8 @@ const ARROW: &str = "❯";
 
 /// Monty — a sandboxed Python interpreter written in Rust.
 ///
-/// - `monty` starts an empty interactive REPL
-/// - `monty <file>` runs the file in script mode
-/// - `monty -c <cmd>` executes `<cmd>` as a Python program
-/// - `monty -i` starts an empty interactive REPL
-/// - `monty -i <file>` seeds the REPL with file contents
-/// - `monty -m host::virtual[::mode[::write_limit_bytes]]` mounts a directory into the sandbox
+/// Run `monty` to start an empty interactive REPL. Run a python file with `monty <file>`.
+/// Execute a command with `monty -c <cmd>`.
 #[derive(Parser)]
 #[command(version)]
 struct Cli {
@@ -83,6 +81,18 @@ struct Cli {
     /// Maximum call-stack depth (defaults to 1000 when any limit is set).
     #[arg(long)]
     max_recursion_depth: Option<usize>,
+
+    /// Run as a protocol child: read framed protobuf requests on stdin and
+    /// write framed events on stdout (see the monty-proto crate). Intended to
+    /// be driven by a parent process such as monty-pool, not by hand.
+    #[arg(
+        long,
+        conflicts_with_all = [
+            "interactive", "type_check", "command", "file", "mounts",
+            "max_allocations", "max_duration", "max_memory", "gc_interval", "max_recursion_depth",
+        ],
+    )]
+    subprocess: bool,
 }
 
 impl Cli {
@@ -127,6 +137,10 @@ const EXT_FUNCTIONS: bool = false;
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+
+    if cli.subprocess {
+        return subprocess::run();
+    }
 
     let type_check_enabled = cli.type_check;
 
