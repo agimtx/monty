@@ -298,29 +298,28 @@ impl Scheduler {
         self.ready_queue.retain(|&id| id != task_id);
     }
 
-    /// Spawns a new task from a coroutine.
+    /// Spawns a new task from a coroutine, enforcing one-task-per-coroutine.
     ///
-    /// Creates a new task that will execute the given coroutine when scheduled.
-    /// The task is added to the ready queue.
+    /// Returns `None` if `coroutine_id` is already driving a task — caught
+    /// here because cross-gather reuse can hit two spawns while both
+    /// coroutine states are still `New`, so the state check in
+    /// `await_coroutine` doesn't catch it. Callers translate `None` into a
+    /// `RuntimeError: cannot reuse already awaited coroutine`.
     ///
     /// Both `coroutine_id` and `gather_id` (when present) become **owning**
-    /// references held by the new task — `inc_ref` is called on each before
-    /// storing. The matching `dec_ref` happens in [`Scheduler::remove_task`]
-    /// when the task is eventually removed (typically at gather finalization).
-    ///
-    /// # Arguments
-    /// * `heap` - Heap to increment reference counts in
-    /// * `coroutine_id` - HeapId of the coroutine to execute
-    /// * `gather_id` - Optional HeapId of the GatherFuture this task belongs to
-    ///
-    /// # Returns
-    /// The TaskId of the newly created task.
+    /// references held by the new task; the matching `dec_ref` happens in
+    /// [`Scheduler::cancel_task`].
+    #[must_use]
     pub fn spawn(
         &mut self,
         heap: &Heap<impl ResourceTracker>,
         coroutine_id: HeapId,
         gather_id: Option<HeapId>,
-    ) -> TaskId {
+    ) -> Option<TaskId> {
+        if self.coroutine_to_task.contains_key(&coroutine_id) {
+            return None;
+        }
+
         let task_id = TaskId::new(self.next_task_id);
         self.next_task_id += 1;
 
@@ -336,7 +335,7 @@ impl Scheduler {
         self.coroutine_to_task.insert(coroutine_id, task_id);
         self.ready_queue.push_back(task_id);
 
-        task_id
+        Some(task_id)
     }
 
     /// Returns the task driving `coroutine_id`, if any.

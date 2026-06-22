@@ -294,6 +294,13 @@ impl ExcType {
         SimpleException::new_msg(Self::TypeError, format!("'{type_}' object can't be awaited")).into()
     }
 
+    /// Creates the canonical `RuntimeError: cannot reuse already awaited coroutine`,
+    /// raised on direct re-await and on cross-gather coroutine reuse.
+    #[must_use]
+    pub(crate) fn cannot_reuse_already_awaited_coroutine() -> RunError {
+        SimpleException::new_msg(Self::RuntimeError, "cannot reuse already awaited coroutine").into()
+    }
+
     /// Creates a TypeError for item assignment on types that don't support it.
     ///
     /// Matches CPython's format: `TypeError: '{type}' object does not support item assignment`
