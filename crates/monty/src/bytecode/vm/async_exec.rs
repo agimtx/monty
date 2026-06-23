@@ -16,12 +16,12 @@ use crate::{
     MontyException,
     asyncio::{
         AwaitedGather, Awaiter, CallId, Coroutine, CoroutineState, ExternalFuture, ExternalFutureState, GatherFuture,
-        GatherState, TaskId,
+        GatherState, TaskId, awaited_state_size,
     },
     bytecode::vm::scheduler::{Scheduler, SerializedTaskFrame, TaskState},
     defer_drop,
     exception_private::{ExcType, RunError, RunResult, SimpleException},
-    heap::{DropWithHeap, HeapData, HeapGuard, HeapId, HeapRead, HeapReadOutput, HeapReader},
+    heap::{DropWithHeap, HeapData, HeapGuard, HeapId, HeapItem, HeapRead, HeapReadOutput, HeapReader},
     intern::FunctionId,
     resource::ResourceTracker,
     run_progress::ExtFunctionResult,
@@ -164,6 +164,25 @@ impl<'h, T: ResourceTracker> VM<'h, T> {
 
         let results = results_guard.into_inner();
         let (awaiter, this) = awaiter_guard.into_parts();
+        // `Pending` reports 0 state-size, so the new `Awaited` bookkeeping
+        // *is* the delta. Pre-charge from the still-owned locals before
+        // committing the state: a rejected charge that landed after the
+        // mutation would leave bytes that were never added, then `fail`
+        // would shrink them and drift the tracker counter downward.
+        // Reuse the same formula `GatherFuture::py_estimate_size` uses so
+        // the eventual shrink matches the charge exactly.
+        let delta = awaited_state_size(&pending_children, &results);
+        if let Err(err) = this.heap.track_growth(delta) {
+            let err = RunError::from(err);
+            // Roll back: gather is still `Pending`, so the locals (awaiter,
+            // results) and the committed children own resources that need
+            // releasing. Cache the failure so a re-await replays it.
+            gather.get_mut(this.heap).state = GatherState::Failed(err.clone());
+            awaiter.drop_with_heap(this.heap);
+            results.drop_with_heap(this.heap);
+            drop_committed_children(pending_children, &mut this.scheduler, this.heap, &err);
+            return Err(err);
+        }
         gather.get_mut(this.heap).state = GatherState::Awaited(AwaitedGather {
             awaiter,
             pending_children,
@@ -203,9 +222,9 @@ impl<'h, T: ResourceTracker> VM<'h, T> {
                 HeapReadOutput::Coroutine(coro) => {
                     // Reject reuse up-front: either the coroutine is no longer
                     // `New`, or another gather already spawned it (`spawn`
-                    // returns `None`).
+                    // returns `Ok(None)`).
                     if coro.get(self.heap).state != CoroutineState::New
-                        || self.scheduler.spawn(self.heap, item_id, Some(gather_id)).is_none()
+                        || self.scheduler.spawn(self.heap, item_id, Some(gather_id))?.is_none()
                     {
                         return Err(ExcType::cannot_reuse_already_awaited_coroutine());
                     }
@@ -323,10 +342,7 @@ impl<'h, T: ResourceTracker> VM<'h, T> {
             // Save current task context ONLY when switching to another task.
             // This is critical: if we're about to yield (no ready tasks), the main task's
             // frames must stay in the VM so they're included in the snapshot.
-            if let Some(current_task_id) = self.scheduler.current_task_id() {
-                self.save_task_context(current_task_id);
-            }
-
+            self.save_current_context_or_requeue(next_task_id)?;
             self.scheduler.set_current_task(Some(next_task_id));
 
             // Load or initialize the next task's context
@@ -339,6 +355,22 @@ impl<'h, T: ResourceTracker> VM<'h, T> {
             // Don't save the main task's context - frames stay in VM for the snapshot.
             Ok(AwaitResult::Yield(self.scheduler.pending_call_ids()))
         }
+    }
+
+    /// Saves the current task's context before switching to `next_task_id`.
+    ///
+    /// If the save fails (typically a tracker growth rejection) the dequeued
+    /// `next_task_id` is restored to the head of the ready queue so a
+    /// recoverable error path can still schedule it later. No-op when there
+    /// is no current task to save.
+    fn save_current_context_or_requeue(&mut self, next_task_id: TaskId) -> Result<(), RunError> {
+        if let Some(current_task_id) = self.scheduler.current_task_id()
+            && let Err(err) = self.save_task_context(current_task_id)
+        {
+            self.scheduler.requeue_ready_front(next_task_id);
+            return Err(err);
+        }
+        Ok(())
     }
 
     /// Handles completion of a spawned task.
@@ -492,8 +524,19 @@ impl<'h, T: ResourceTracker> VM<'h, T> {
     /// Saves the current VM context into the given task in the scheduler.
     ///
     /// Serializes frames, moves stack/exception_stack, stores instruction_ip,
-    /// and adjusts the global recursion depth counter.
-    fn save_task_context(&mut self, task_id: TaskId) {
+    /// adjusts the global recursion depth counter, and charges the saved
+    /// state's size against the tracker — released by `load_or_init_task`
+    /// when the context is moved back, or by `cancel_task` if the task
+    /// is torn down while suspended.
+    ///
+    /// Charging happens *before* draining VM state so a budget rejection
+    /// leaves `self.frames` intact for the exception unwinder to walk.
+    fn save_task_context(&mut self, task_id: TaskId) -> Result<(), RunError> {
+        let saved_size = self.frames.len() * mem::size_of::<SerializedTaskFrame>()
+            + mem::size_of_val(self.stack.as_slice())
+            + mem::size_of_val(self.exception_stack.as_slice());
+        self.heap.track_growth(saved_size)?;
+
         let frames: Vec<SerializedTaskFrame> = self
             .frames
             .drain(..)
@@ -519,6 +562,8 @@ impl<'h, T: ResourceTracker> VM<'h, T> {
         task.stack = mem::take(&mut self.stack);
         task.exception_stack = mem::take(&mut self.exception_stack);
         task.instruction_ip = self.instruction_ip;
+
+        Ok(())
     }
 
     /// Loads an existing task's context or initializes a new task from its coroutine.
@@ -532,6 +577,12 @@ impl<'h, T: ResourceTracker> VM<'h, T> {
     /// (balances the subtraction in `save_task_context`).
     fn load_or_init_task(&mut self, task_id: TaskId) -> Result<(), RunError> {
         let task = self.scheduler.get_task_mut(task_id);
+        // Snapshot the charge to release *before* draining the Vecs out of
+        // `task`; the released bytes mirror what `save_task_context`
+        // charged. VM-local Vecs are untracked (matching the rest of the
+        // stack accounting); a fresh task with no saved context makes
+        // this a no-op.
+        let saved_size = task.saved_context_size();
         let frames = mem::take(&mut task.frames);
         let stack = mem::take(&mut task.stack);
         let exception_stack = mem::take(&mut task.exception_stack);
@@ -542,6 +593,8 @@ impl<'h, T: ResourceTracker> VM<'h, T> {
         let task_depth = frames.len().saturating_sub(1); // root frame doesn't contribute to recursion depth
         let global_depth = self.heap.get_recursion_depth();
         self.heap.set_recursion_depth(global_depth + task_depth);
+
+        self.heap.track_shrink(saved_size);
 
         if !frames.is_empty() {
             // Task has existing context - restore it
@@ -700,19 +753,30 @@ impl<'h, T: ResourceTracker> VM<'h, T> {
     /// has already been cancelled (no longer in the scheduler) or failed,
     /// drops `value` instead — the resolution still gets cached on the future,
     /// but the (now-gone) awaiter doesn't receive it.
-    fn deliver_value_to_task(&mut self, task_id: TaskId, value: Value) {
+    ///
+    /// Pushing onto a parked task's `task.stack` grows the saved-context size
+    /// that `load_or_init_task` will later shrink by — so this path pre-charges
+    /// one `Value` slot against the tracker. The current-task branch pushes
+    /// onto the VM's untracked stack, matching the rest of the stack
+    /// accounting.
+    fn deliver_value_to_task(&mut self, task_id: TaskId, value: Value) -> RunResult<()> {
         if !self.scheduler.has_task(task_id) || self.scheduler.is_task_failed(task_id) {
             value.drop_with_heap(self);
-            return;
+            return Ok(());
         }
 
         let task_is_current = self.scheduler.current_task_id() == Some(task_id) && !self.frames.is_empty();
         if task_is_current {
             self.stack.push(value);
         } else {
+            if let Err(err) = self.heap.track_growth(mem::size_of::<Value>()) {
+                value.drop_with_heap(self);
+                return Err(err.into());
+            }
             self.scheduler.get_task_mut(task_id).stack.push(value);
         }
         self.scheduler.make_ready(task_id, self.heap);
+        Ok(())
     }
 
     /// Delivers `value` along the awaiter chain starting at `awaiter`.
@@ -737,7 +801,7 @@ impl<'h, T: ResourceTracker> VM<'h, T> {
         loop {
             match awaiter {
                 Awaiter::Task(t) => {
-                    this.deliver_value_to_task(t, value);
+                    this.deliver_value_to_task(t, value)?;
                     return Ok(Some(t));
                 }
                 Awaiter::GatherSlot { gather, source } => {
@@ -896,9 +960,7 @@ impl<'h, T: ResourceTracker> VM<'h, T> {
         // Current task was not able to resume, but there might be other ready tasks which can make
         // progress
         if let Some(next_task_id) = self.scheduler.next_ready_task() {
-            if let Some(current_task_id) = self.scheduler.current_task_id() {
-                self.save_task_context(current_task_id);
-            }
+            self.save_current_context_or_requeue(next_task_id)?;
             self.scheduler.set_current_task(Some(next_task_id));
             self.load_or_init_task(next_task_id)?;
             return self.run_external();
@@ -935,8 +997,14 @@ impl<'h> HeapRead<'h, GatherFuture> {
     /// (empty gather, all externals already resolved); on the async path the
     /// transition happens inside [`Self::resolve_child`].
     pub(crate) fn cache_result(&mut self, heap: &mut HeapReader<'h, impl ResourceTracker>, list_id: HeapId) {
+        // Pending and Completed both report 0 state-size, so this is a
+        // no-op on the synchronous-completion path and a real shrink
+        // when transitioning out of `Awaited`.
+        let old_size = self.get(heap).py_estimate_size();
         heap.inc_ref(list_id);
         self.get_mut(heap).state = GatherState::Completed(Value::Ref(list_id));
+        let new_size = self.get(heap).py_estimate_size();
+        heap.track_shrink(old_size.saturating_sub(new_size));
     }
 
     /// Records one child's resolution on this gather and, if everything has
@@ -1029,6 +1097,10 @@ impl<'h> HeapRead<'h, GatherFuture> {
         heap: &mut HeapReader<'h, impl ResourceTracker>,
         error: &RunError,
     ) -> Awaiter {
+        // Captured before draining so the decrement below balances the
+        // `track_growth` from the Pending → Awaited transition.
+        let old_size = self.get(heap).py_estimate_size();
+
         // Take the Awaited bookkeeping. The state stays `Awaited` (with
         // placeholder fields) until the state replace below commits the
         // transition. The extracted `awaiter` is transferred to the caller
@@ -1047,6 +1119,8 @@ impl<'h> HeapRead<'h, GatherFuture> {
 
         // Cache a clone so re-awaits replay the same exception.
         self.get_mut(heap).state = GatherState::Failed(error.clone());
+        let new_size = self.get(heap).py_estimate_size();
+        heap.track_shrink(old_size.saturating_sub(new_size));
 
         // Drop fanned-out result Values that won't reach the waiter.
         results.drop_with_heap(heap);

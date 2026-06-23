@@ -922,6 +922,17 @@ impl<T: ResourceTracker> Heap<T> {
         self.tracker.on_grow(additional_bytes)
     }
 
+    /// Mirror of [`track_growth`](Self::track_growth) for in-place shrinks.
+    ///
+    /// Needed when a heap entry's `py_estimate_size` decreases without the
+    /// entry itself being freed: `on_free` at entry release reads the
+    /// *current* size, so growth charged earlier would otherwise leak in
+    /// the tracker counter.
+    #[inline]
+    pub fn track_shrink(&self, bytes: usize) {
+        self.tracker.on_free(|| bytes);
+    }
+
     /// Increments the recursion depth and checks the limit via the `ResourceTracker`.
     ///
     /// Returns `Ok(RecursionToken)` if within limits. The caller must ensure the
