@@ -373,7 +373,7 @@ pub mod parent_request {
     #[derive(Clone, PartialEq, ::prost::Oneof)]
     pub enum Kind {
         #[prost(message, tag = "1")]
-        ReplCreate(super::ReplCreate),
+        Configure(super::Configure),
         #[prost(message, tag = "2")]
         ReplFeed(super::ReplFeed),
         #[prost(message, tag = "3")]
@@ -392,10 +392,13 @@ pub mod parent_request {
         Shutdown(super::Shutdown),
     }
 }
-/// Creates the REPL session this child will serve until `Reset`. Valid only
-/// when the child has no session.
+/// Configures the REPL session this child will serve until `Reset`, sent once
+/// when the worker is checked out. The session's repl is materialized lazily on
+/// the first `ReplFeed` (or restored by `Load`), so a checked-out-but-unfed
+/// worker can still be initialized by `Load` instead. Valid only when the
+/// worker has no session yet.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct ReplCreate {
+pub struct Configure {
     #[prost(string, tag = "1")]
     pub script_name: ::prost::alloc::string::String,
     #[prost(message, optional, tag = "2")]
@@ -462,16 +465,23 @@ pub struct ResumeFutures {
 /// be restored by a monty child of the same version via `Load`.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct Dump {}
-/// Restores state produced by `Dump` into a fresh child (no session). If the
-/// restored state was suspended, the child re-emits the suspension event so
+/// Restores state produced by `Dump`. Valid only from no session. If
+/// the restored state was suspended, the child re-emits the suspension event so
 /// the parent learns the resume point; otherwise it replies `Ok`.
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct Load {
     #[prost(bytes = "vec", tag = "1")]
     pub state: ::prost::alloc::vec::Vec<u8>,
+    /// Mounts to re-establish for a suspended feed being resumed. Mounts are
+    /// host configuration, not sandbox state, so they are never part of the dump
+    /// — the parent re-supplies the same mounts it used for the original feed.
+    /// Without them a restored feed has no mounts and its OS calls all bubble up.
+    /// When the restored state is idle this must be empty.
+    #[prost(message, repeated, tag = "2")]
+    pub mounts: ::prost::alloc::vec::Vec<Mount>,
 }
 /// Ends the checkout: the child drops all session state and returns to the
-/// no-session state, ready for the next `ReplCreate` or `Load`.
+/// no-session state, ready for the next `Configure` or `Load`.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct Reset {}
 /// The child replies `Ok` and exits cleanly.
@@ -494,6 +504,12 @@ pub struct ChildEvent {
     /// state bytes) still learns the budget.
     #[prost(uint64, optional, tag = "13")]
     pub max_duration_micros: ::core::option::Option<u64>,
+    /// The session's script name, surfaced on a `Load` reply so a parent that
+    /// restored a session (whose script name, like the limits above, travels
+    /// inside the opaque dump bytes) learns it without parsing the dump. Set only
+    /// on a successful `Load` reply; unset on all other events.
+    #[prost(string, optional, tag = "14")]
+    pub restored_script_name: ::core::option::Option<::prost::alloc::string::String>,
     #[prost(oneof = "child_event::Kind", tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11")]
     pub kind: ::core::option::Option<child_event::Kind>,
 }
@@ -618,7 +634,7 @@ pub struct DumpResult {
     #[prost(bytes = "vec", tag = "1")]
     pub state: ::prost::alloc::vec::Vec<u8>,
 }
-/// Generic acknowledgement for ReplCreate / Load (idle) / Reset / Shutdown.
+/// Generic acknowledgement for Configure / Load (idle) / Reset / Shutdown.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct Ok {}
 /// The child hit an unrecoverable error (frame desync, panic, unsupported
