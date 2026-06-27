@@ -431,6 +431,13 @@ pub enum StaticStrings {
     // module strings
     // ==========================
 
+    // aq module strings
+    /// Module name for `import aq`.
+    Aq,
+    /// `aq.hello()` function and its return value.
+    Hello,
+
+    // ==========================
     // math module strings
     Math,
     // Rounding

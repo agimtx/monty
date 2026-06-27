@@ -1,0 +1,16 @@
+[package]
+name = "aq"
+version = { workspace = true }
+license = { workspace = true }
+rust-version = { workspace = true }
+edition = { workspace = true }
+authors = { workspace = true }
+description = "AQ Python module logic for Monty."
+publish = false
+
+[lib]
+name = "aq"
+path = "src/lib.rs"
+
+[lints]
+workspace = true

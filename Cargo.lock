@@ -171,6 +171,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "aq"
+version = "0.0.18"
+
+[[package]]
 name = "arbitrary"
 version = "1.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1936,6 +1940,7 @@ name = "monty"
 version = "0.0.18"
 dependencies = [
  "ahash",
+ "aq",
  "chrono",
  "fancy-regex 0.17.0",
  "hashbrown 0.16.1",

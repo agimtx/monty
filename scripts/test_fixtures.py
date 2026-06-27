@@ -23,9 +23,10 @@ from __future__ import annotations
 import asyncio
 import os
 import stat as stat_module
+import sys
 from dataclasses import dataclass
 from pathlib import Path
-from types import TracebackType
+from types import ModuleType, TracebackType
 
 
 def add_ints(a: int, b: int) -> int:
@@ -123,6 +124,16 @@ CONST_FLOAT = 3.14
 CONST_BOOL = True
 CONST_LIST = [1, 2, 3]
 CONST_NONE = None
+
+
+def _aq_hello() -> str:
+    """CPython shim for Monty's `aq.hello()` built-in module function."""
+    return 'hello'
+
+
+aq_module = ModuleType('aq')
+setattr(aq_module, 'hello', _aq_hello)
+sys.modules.setdefault('aq', aq_module)
 
 
 def async_call(x: object) -> 'asyncio.Future[object]':

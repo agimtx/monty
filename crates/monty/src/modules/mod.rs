@@ -16,6 +16,7 @@ use crate::{
     resource::{ResourceError, ResourceTracker},
 };
 
+pub(crate) mod aq;
 pub(crate) mod asyncio;
 pub(crate) mod datetime;
 #[cfg(feature = "test-hooks")]
@@ -32,6 +33,8 @@ pub(crate) mod typing;
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, FromRepr)]
 pub(crate) enum StandardLib {
+    /// The `aq` module providing project-specific sandbox helpers.
+    Aq,
     /// The `sys` module providing system-specific parameters and functions.
     Sys,
     /// The `typing` module providing type hints support.
@@ -65,6 +68,7 @@ impl StandardLib {
     /// Get the module from a string ID.
     pub fn from_string_id(string_id: StringId) -> Option<Self> {
         match StaticStrings::from_string_id(string_id)? {
+            StaticStrings::Aq => Some(Self::Aq),
             StaticStrings::Sys => Some(Self::Sys),
             StaticStrings::Typing => Some(Self::Typing),
             StaticStrings::Asyncio => Some(Self::Asyncio),
@@ -89,6 +93,7 @@ impl StandardLib {
     /// Panics if the required strings have not been pre-interned during prepare phase.
     pub fn create(self, vm: &mut VM<'_, impl ResourceTracker>) -> Result<HeapId, ResourceError> {
         match self {
+            Self::Aq => aq::create_module(vm),
             Self::Sys => sys::create_module(vm),
             Self::Typing => typing::create_module(vm),
             Self::Asyncio => asyncio::create_module(vm),
@@ -107,6 +112,7 @@ impl StandardLib {
 /// All stdlib module function (but not builtins).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub(crate) enum ModuleFunctions {
+    Aq(aq::AqFunctions),
     Asyncio(asyncio::AsyncioFunctions),
     Json(json::JsonFunctions),
     Math(math::MathFunctions),
@@ -127,6 +133,7 @@ pub(crate) enum ModuleFunctions {
 impl fmt::Display for ModuleFunctions {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Aq(func) => write!(f, "{func}"),
             Self::Asyncio(func) => write!(f, "{func}"),
             Self::Json(func) => write!(f, "{func}"),
             Self::Math(func) => write!(f, "{func}"),
@@ -147,6 +154,7 @@ impl ModuleFunctions {
     /// require host involvement (e.g., `os.getenv()` needs the host to provide environment variables).
     pub fn call(self, vm: &mut VM<'_, impl ResourceTracker>, args: ArgValues) -> RunResult<CallResult> {
         match self {
+            Self::Aq(functions) => aq::call(vm, functions, args).map(CallResult::Value),
             Self::Asyncio(functions) => asyncio::call(vm, functions, args),
             Self::Json(functions) => json::call(vm, functions, args).map(CallResult::Value),
             Self::Math(functions) => math::call(vm, functions, args).map(CallResult::Value),

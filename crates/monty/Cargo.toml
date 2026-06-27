@@ -17,6 +17,7 @@ name = "monty"
 path = "src/lib.rs"
 
 [dependencies]
+aq = { path = "../aq" }
 ruff_python_parser = { workspace = true }
 ruff_python_stdlib = { workspace = true }
 ruff_python_ast = { workspace = true }
